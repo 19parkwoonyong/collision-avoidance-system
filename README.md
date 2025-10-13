@@ -10,7 +10,7 @@ IP 주소 등 개인 환경에 맞는 부분은 .env 또는 코드 주석의 "yo
 | **React 프론트엔드**  | 관리자 대시보드 (로그인, 장치 상태 실시간 표시)             | `frontend/src/App.js` |
 | **Raspberry Pi** | PIR + 초음파 센서 데이터 감지 후 Flask 서버로 보고       | `raspberry/chair1.py` |
 
-
+###
 ⚙️ 1. 환경 준비
 ✅ Python 3.9 이상
 
