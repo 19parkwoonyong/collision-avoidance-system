@@ -67,7 +67,7 @@ python app.py
 이제 Flask 서버가 5000번 포트에서 API 요청을 받을 준비가 됨.
 헬스체크: http://localhost:5000/api/health
 
-
+---
 💻 3. React (프론트엔드) 설정
 📁 이동
 cd frontend
@@ -107,7 +107,7 @@ npm start
 
 클릭: 상세정보 및 코드 실행/중지 버튼
 
-
+---
 🧠 4. Raspberry Pi (센서 코드)
 📁 코드 구조
 
@@ -139,7 +139,7 @@ POST /api/device-report 200 OK
 
 React 대시보드에서도 상태가 자동 갱신됨 ✅
 
-
+---
 🔌 5. 실행 순서 요약
 | 단계  | 위치           | 명령                  |
 | --- | ------------ | ------------------- |
@@ -148,7 +148,7 @@ React 대시보드에서도 상태가 자동 갱신됨 ✅
 | 3️⃣ | `raspberry/` | `python3 chair1.py` |
 
 
-
+---
 🔍 6. 기본 점검 포인트
 | 항목       | 확인 방법                              | 기대 결과            |
 | -------- | ---------------------------------- | ---------------- |
@@ -157,7 +157,7 @@ React 대시보드에서도 상태가 자동 갱신됨 ✅
 | 센서 보고    | Flask 터미널 출력                       | `received: True` |
 | 대시보드 갱신  | React 상세 화면                        | 거리/시간/상태 갱신됨     |
 
-
+---
 🧰 7. 수동 명령 예시
 장치 시드 (DB 초기화)
 curl -X POST http://localhost:5000/api/seed -H "Content-Type: application/json" -d '{"names":["chair1"]}'
@@ -165,7 +165,7 @@ curl -X POST http://localhost:5000/api/seed -H "Content-Type: application/json" 
 센서 테스트 보고
 curl -X POST http://localhost:5000/api/device-report -H "Content-Type: application/json" -d '{"device":"chair1","message":"테스트 보고","signal_strength":"-60","distance":"45"}'
 
-
+---
 ⚠️ 8. 주의사항
 구분	주의 내용
 .env	절대 깃허브에 올리지 말 것
@@ -173,7 +173,7 @@ users.db	실제 사용자 정보 저장 → 업로드 금지
 포트 충돌	Flask(5000), React(3000) 동시에 사용
 SSH 원격실행	SSH 비활성화 시 Flask는 로컬만 동작
 
-
+---
 🧾 9. requirements.txt 내용 (참고)
 
 만약 직접 만들어야 한다면:
@@ -185,9 +185,10 @@ Flask-SQLAlchemy==3.1.1
 Werkzeug==3.0.3
 requests==2.31.0
 
-
+---
 10. 시스템 간략 요약도
 <img width="944" height="229" alt="image" src="https://github.com/user-attachments/assets/dd478850-8ee5-4108-8401-c7a2fbc46900" />
+<img width="783" height="540" alt="image" src="https://github.com/user-attachments/assets/8cf3a73e-b5e3-4276-a62f-24679edf9794" />
 
 
 
