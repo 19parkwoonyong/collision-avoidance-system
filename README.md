@@ -21,7 +21,7 @@ React 프론트엔드용 (권장 Node 20+)
 
 ✅ Raspberry Pi 4 (권장)
 
-센서 제어용 (PIR + HC-SR04P + LED)
+센서 제어용 (PIR + HC-SR04P + LED + HW-508)
 
 ---
 🧩 2. Python (Flask 서버) 설정
@@ -119,6 +119,8 @@ PIR 센서 (GPIO 17)
 
 LED (GPIO 25)
 
+Active buzzer : GPIO 18 (PWM 게이팅 + 220Ω 저항으로 음량 조절)
+
 Flask 서버로 주기적 보고 (POST /api/device-report)
 
 ⚙️ 필요한 모듈 설치
@@ -126,11 +128,16 @@ Flask 서버로 주기적 보고 (POST /api/device-report)
 라즈베리파이 터미널에서:
 
 sudo apt update
-sudo apt install python3-rpi.gpio python3-requests -y
+sudo apt install -y python3-rpi.gpio python3-requests wireless-tools iw
 
 ▶️ 센서 코드 실행
 python3 chair1.py
 
+주요 기능
+
+빠른 추적(0.1s) + 안티-플리커(최소 점등/소등 유지)
+서버 주기 보고: POST /api/device-report
+로컬 제어 API(내장 HTTP): /health, /wake, /sleep, /quit
 
 Flask 서버 콘솔에 다음과 같은 로그가 찍히면 성공:
 
