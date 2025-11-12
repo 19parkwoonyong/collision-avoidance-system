@@ -1,55 +1,68 @@
 #!/usr/bin/env python3
-# Raspberry Pi TDM agent — PIR HIGH 동안 0.2s 간격 초음파 추적, 임계 도달 시 LED 점등 후 대기/재개
+# Raspberry Pi agent (PIR + HC-SR04 + 3xLED + Active Buzzer + server reporting) with built-in REST control
+# + Fast ultrasonic tracking (0.1s) + Anti-flicker LED latch + Buzzer PWM volume control
 # sudo apt -y install python3-rpi.gpio python3-requests wireless-tools iw
 
-import sys, time, argparse, statistics, subprocess
+import sys, time, argparse, statistics, subprocess, threading, socket, json
 import datetime as dt
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import requests
 import RPi.GPIO as GPIO
 
 # ---------- 기본값 ----------
-DEFAULT_SERVER   = "http://'your IP adrress':5000"
+DEFAULT_SERVER   = "http://'your server IP address':5000"
 DEFAULT_DEVICE   = "chair1"
 
-# 핀은 BCM 번호
-DEF_PIR  = 17
-DEF_TRIG = 23
-DEF_ECHO = 24   # ★ 5V→3.3V 레벨다운 필수
-DEF_LED  = 25
+# 핀(BCM)
+DEF_PIR   = 17
+DEF_TRIG  = 23
+DEF_ECHO  = 24   # ★ 5V→3.3V 레벨다운 필수
+DEF_LED1  = 25
+DEF_LED2  = 22
+DEF_LED3  = 27
+DEF_BUZZER= 18   # 능동부저(Active buzzer) — 단순 HIGH=ON, LOW=OFF
 
-# 동작 파라미터
-DISTANCE_THRESHOLD_CM    = 150.0     # 임계 거리
-COOLDOWN_MS              = 3000      # LED ON 유지 시간
-POWER_POLL_MS            = 3000
-REPORT_MIN_INTERVAL_MS   = 1000
-WARMUP_SECONDS_DEFAULT   = 45
-ULTRA_TIMEOUT_S          = 0.04      # 에지 대기 타임아웃
-DIST_MIN_CM, DIST_MAX_CM = 2.0, 400.0
-HTTP_TIMEOUT             = 2.5
+# ---------- 동작 파라미터 ----------
+DISTANCE_THRESHOLD_CM      = 130.0
+MEASUREMENT_INTERVAL_MS    = 3000   # 주기측정
+COOLDOWN_MS                = 3000
+POWER_POLL_MS              = 3000
+REPORT_MIN_INTERVAL_MS     = 1000
+WARMUP_SECONDS_DEFAULT     = 45
+ULTRA_TIMEOUT_S            = 0.04
+ULTRA_SAMPLES              = 3
+DIST_MIN_CM, DIST_MAX_CM   = 2.0, 400.0
+HTTP_TIMEOUT               = 2.5
 
-# ---------- 재무장(재시작) 정책 ----------
-# - "edge": PIR이 LOW→HIGH 에지가 생겨야만 재무장(기존 설계와 유사)
-# - "cooldown": 쿨다운 종료 직후, PIR이 HIGH면 즉시 재무장+추적 재개
-REARM_MODE = "cooldown"
+# 빠른 추적(즉각 대응)
+FAST_TRACK_INTERVAL_MS     = 100    # 0.1s
+REARM_MODE                 = "cooldown"  # "edge" or "cooldown"
 
-# ---------- TDM (0.2초 간격 보장) ----------
-SLOT_MS   = 50             # 1 슬롯 = 50ms
-NUM_SLOTS = 4              # 4 슬롯 = 200ms(0.2s) 슈퍼프레임
+# --- Anti-flicker LED 제어 ---
+LED_MIN_ON_MS              = 250
+LED_MIN_OFF_MS             = 100
+CONSEC_CLOSE_REQUIRED      = 2
 
-# 슬롯 배치
-SLOT_TASKS = {
-    0: "POWER_POLL",     # 3초 스로틀
-    1: "PIR_SAMPLE",     # PIR 상태 및 에지 감지, 무장(armed) 관리
-    2: "ULTRA_TRACK",    # ★ 0.2초 간격 초음파 추적
-    3: "LED_HB",         # LED 쿨다운 관리 + 하트비트
-}
+# --- Buzzer PWM(음량 조절) ---
+USE_BUZZER_PWM   = True     # True면 PWM으로 평균출력 낮춰 음량 감소
+BUZZER_PWM_FREQ  = 5000     # 2 kHz 게이팅 (필요시 1500~4000 튜닝)
+BUZZER_PWM_DUTY  = 30       # % (작을수록 더 조용함. 예: 10~30)
 
-# ---------- 유틸 ----------
+# ---------- util ----------
 try: sys.stdout.reconfigure(line_buffering=True)
 except Exception: pass
 log = lambda *a, **k: print(*a, **k, flush=True)
-def now_ms(): return int(time.monotonic() * 1000)
-def ms_since(ts): return now_ms() - ts
+def now_ms() -> int: return int(time.monotonic() * 1000)
+
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
 
 # ---------- RSSI ----------
 def read_rssi():
@@ -72,8 +85,9 @@ def read_rssi():
         pass
     return None
 
-# ---------- 서버 ----------
-def report(base, device, message, distance=None):
+# ---------- 서버 통신 ----------
+def report(base, device, message, distance=None, control_url=None):
+    url = f"{base}/api/device-report"
     url = f"{base}/api/device-report"
     payload = {
         "device": device,
@@ -81,6 +95,7 @@ def report(base, device, message, distance=None):
         "distance": float(distance) if distance is not None else None,
         "signal_strength": read_rssi()
     }
+    if control_url: payload["control_url"] = control_url
     try:
         requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
         return True
@@ -98,7 +113,7 @@ def get_power_flag(base, device, default=True) -> bool:
     return default
 
 # ---------- GPIO ----------
-def setup_gpio(pir, trig, echo, led, pud_mode: str):
+def setup_gpio(pir, trig, echo, led_pins, buzzer, pud_mode: str):
     GPIO.setwarnings(False)
     GPIO.setmode(GPIO.BCM)
     if pud_mode == "up":
@@ -109,7 +124,10 @@ def setup_gpio(pir, trig, echo, led, pud_mode: str):
         GPIO.setup(pir, GPIO.IN, pull_up_down=GPIO.PUD_DOWN); used = "PUD_DOWN"
     GPIO.setup(trig, GPIO.OUT); GPIO.output(trig, GPIO.LOW)
     GPIO.setup(echo, GPIO.IN)
-    GPIO.setup(led,  GPIO.OUT); GPIO.output(led, GPIO.LOW)
+    for pin in led_pins:
+        GPIO.setup(pin, GPIO.OUT); GPIO.output(pin, GPIO.LOW)
+    # buzzer (능동부저: ON/OFF or PWM 게이팅)
+    GPIO.setup(buzzer, GPIO.OUT); GPIO.output(buzzer, GPIO.LOW)
     return used
 
 def maybe_switch_pud_auto(pir, current_used: str) -> str:
@@ -123,12 +141,34 @@ def maybe_switch_pud_auto(pir, current_used: str) -> str:
         return "PUD_UP"
     return current_used
 
-def led_set(pin, on: bool):
-    GPIO.output(pin, GPIO.HIGH if on else GPIO.LOW)
+def leds_hw_set(led_pins, on: bool):
+    lvl = GPIO.HIGH if on else GPIO.LOW
+    for p in led_pins: GPIO.output(p, lvl)
+
+# --- Buzzer: PWM/ON-OFF 공용 제어 ---
+buz_pwm = None  # PWM 핸들(전역)
+
+def buzzer_hw_set(pin, on: bool):
+    global buz_pwm
+    if USE_BUZZER_PWM:
+        if on:
+            if buz_pwm is not None:
+                try:
+                    buz_pwm.start(BUZZER_PWM_DUTY)  # 평균출력 ↓ → 음량 ↓
+                except RuntimeError:
+                    buz_pwm.ChangeDutyCycle(BUZZER_PWM_DUTY)
+        else:
+            if buz_pwm is not None:
+                try:
+                    buz_pwm.stop()
+                except Exception:
+                    pass
+            GPIO.output(pin, GPIO.LOW)
+    else:
+        GPIO.output(pin, GPIO.HIGH if on else GPIO.LOW)
 
 # ---------- 초음파 ----------
 def measure_once_cm(trig, echo, timeout_s=ULTRA_TIMEOUT_S):
-    # 1회 측정 (고속 추적용: 중앙값 없이 단일 샘플)
     GPIO.output(trig, GPIO.LOW); time.sleep(2e-6)
     GPIO.output(trig, GPIO.HIGH); time.sleep(10e-6)
     GPIO.output(trig, GPIO.LOW)
@@ -147,37 +187,95 @@ def measure_once_cm(trig, echo, timeout_s=ULTRA_TIMEOUT_S):
     dist = (pulse * 34300.0) / 2.0
     return round(dist, 1), None
 
+def measure_median_cm(trig, echo, n=ULTRA_SAMPLES):
+    samples = []; last_err = None
+    for _ in range(n):
+        d, err = measure_once_cm(trig, echo)
+        last_err = err or last_err
+        if d is not None and DIST_MIN_CM <= d <= DIST_MAX_CM:
+            samples.append(d)
+        time.sleep(0.01)
+    if not samples:
+        return None, last_err
+    return round(statistics.median(samples), 1), last_err
+
+# ---------- 전역 상태 ----------
+SYSTEM_ACTIVE      = True
+SHUTDOWN_REQUESTED = False
+
+# ---------- 내장 HTTP 제어 서버 ----------
+class CtlHandler(BaseHTTPRequestHandler):
+    def _ok(self, obj):
+        data = json.dumps(obj).encode("utf-8")
+        self.send_response(200); self.send_header("Content-Type","application/json")
+        self.send_header("Content-Length", str(len(data))); self.end_headers()
+        self.wfile.write(data)
+    def _err(self, code, msg):
+        data = json.dumps({"error": msg}).encode("utf-8")
+        self.send_response(code); self.send_header("Content-Type","application/json")
+        self.send_header("Content-Length", str(len(data))); self.end_headers()
+        self.wfile.write(data)
+    def log_message(self, *a): return
+    def do_GET(self):
+        if self.path == "/health": self._ok({"running": True, "active": SYSTEM_ACTIVE})
+        else: self._err(404, "not found")
+    def do_POST(self):
+        global SYSTEM_ACTIVE, SHUTDOWN_REQUESTED
+        if   self.path == "/wake":  SYSTEM_ACTIVE = True;  self._ok({"ok": True, "active": SYSTEM_ACTIVE})
+        elif self.path == "/sleep": SYSTEM_ACTIVE = False; self._ok({"ok": True, "active": SYSTEM_ACTIVE})
+        elif self.path == "/quit":  SHUTDOWN_REQUESTED = True; self._ok({"ok": True, "quitting": True})
+        else: self._err(404, "not found")
+
+def run_ctl_server(host, port):
+    httpd = HTTPServer((host, port), CtlHandler)
+    httpd.serve_forever()
+
 # ---------- 메인 ----------
 def main():
-    parser = argparse.ArgumentParser(description="Pi agent: 0.2s ultrasonic tracking while PIR=HIGH (rearm policies)")
+    parser = argparse.ArgumentParser(description="Pi agent + fast ultrasonic tracking + anti-flicker LED + buzzer PWM volume control")
     parser.add_argument("--server", default=DEFAULT_SERVER)
     parser.add_argument("--device", default=DEFAULT_DEVICE)
-    parser.add_argument("--pir",  type=int, default=DEF_PIR)
-    parser.add_argument("--trig", type=int, default=DEF_TRIG)
-    parser.add_argument("--echo", type=int, default=DEF_ECHO)
-    parser.add_argument("--led",  type=int, default=DEF_LED)
-    parser.add_argument("--pud",  choices=["auto","up","down"], default="auto", help="PIR pull mode")
-    parser.add_argument("--warmup", type=int, default=WARMUP_SECONDS_DEFAULT, help="PIR warmup seconds")
-    # 고급: 슬롯 튜닝 (기본 50ms×4=200ms)
-    parser.add_argument("--slot_ms", type=int, default=SLOT_MS)
-    parser.add_argument("--num_slots", type=int, default=NUM_SLOTS)
+    parser.add_argument("--pir",   type=int, default=DEF_PIR)
+    parser.add_argument("--trig",  type=int, default=DEF_TRIG)
+    parser.add_argument("--echo",  type=int, default=DEF_ECHO)
+    parser.add_argument("--led1",  type=int, default=DEF_LED1)
+    parser.add_argument("--led2",  type=int, default=DEF_LED2)
+    parser.add_argument("--led3",  type=int, default=DEF_LED3)
+    parser.add_argument("--buzzer",type=int, default=DEF_BUZZER)
+    parser.add_argument("--pud",   choices=["auto","up","down"], default="auto")
+    parser.add_argument("--warmup",type=int, default=WARMUP_SECONDS_DEFAULT)
+    parser.add_argument("--ctl-port", type=int, default=5050)
     args = parser.parse_args()
 
-    used_pud = setup_gpio(args.pir, args.trig, args.echo, args.led, args.pud)
-    log(f"[START] {dt.datetime.now():%F %T} server={args.server} device={args.device}")
-    log(f"pins(BCM) PIR:{args.pir} TRIG:{args.trig} ECHO:{args.echo} LED:{args.led}  PUD={used_pud}")
-    report(args.server, args.device, "센서 클라이언트 기동 (0.2s 추적모드, REARM_MODE=%s)" % REARM_MODE)
+    led_pins = [args.led1, args.led2, args.led3]
+    buz_pin  = args.buzzer
 
+    # 제어 서버
+    local_ip = get_local_ip()
+    ctl_url = f"http://{local_ip}:{args.ctl_port}"
+    threading.Thread(target=run_ctl_server, args=("0.0.0.0", args.ctl_port), daemon=True).start()
+
+    # GPIO
+    used_pud = setup_gpio(args.pir, args.trig, args.echo, led_pins, buz_pin, args.pud)
+    log(f"[START] {dt.datetime.now():%F %T} server={args.server} device={args.device}")
+    log(f"pins(BCM) PIR:{args.pir} TRIG:{args.trig} ECHO:{args.echo} LEDS:{led_pins} BUZZER:{buz_pin} PUD={used_pud}")
+    log(f"control_url={ctl_url}")
+    report(args.server, args.device, "센서 클라이언트 기동 (fast+anti-flicker+buzzer-PWM)", control_url=ctl_url)
+
+    # PWM 준비 (시작은 OFF)
+    global buz_pwm
+    if USE_BUZZER_PWM:
+        buz_pwm = GPIO.PWM(buz_pin, BUZZER_PWM_FREQ)
+
+    # PUD auto
     if args.pud == "auto":
         used_pud = maybe_switch_pud_auto(args.pir, used_pud)
-        if used_pud == "PUD_UP":
-            log("PIR 입력 모드 자동 전환: PUD_UP")
+        if used_pud == "PUD_UP": log("PIR 입력 모드 자동 전환: PUD_UP")
 
     # PIR 워밍업
     if args.warmup > 0:
         log(f"PIR 워밍업 중... {args.warmup}s 대기")
-        end = time.monotonic() + args.warmup
-        next_tick = 0
+        end = time.monotonic() + args.warmup; next_tick = 0
         while time.monotonic() < end:
             if time.monotonic() >= next_tick:
                 remain = int(end - time.monotonic())
@@ -186,147 +284,199 @@ def main():
             time.sleep(0.05)
         log("✅ PIR 센서 준비 완료")
 
-    # 상태 변수
-    system_active   = True
-    in_cooldown     = False
-    cooldown_until  = 0
-    prev_pir        = GPIO.input(args.pir)
-    armed           = True          # 다음 감지를 받을 준비 상태
-    tracking_active = False         # PIR=HIGH 동안 0.2s 간격 추적 활성화 여부
-    last_power_poll = 0
-    last_report     = 0
-    last_hb         = 0
+    # 상태 공유
+    global SYSTEM_ACTIVE, SHUTDOWN_REQUESTED
+    SYSTEM_ACTIVE      = True
+    SHUTDOWN_REQUESTED = False
+    state = {
+        "in_cooldown": False,
+        "cooldown_until": 0,
+        "last_measure": 0,
+        "last_power_poll": 0,
+        "last_report": 0,
+        "last_idle_log": 0,
+        "armed": True,
+        # LED 제어(래치 + 최소 유지)
+        "led_desired": False,
+        "led_actual":  False,
+        "last_led_change": 0,
+    }
 
-    # TDM 파라미터
-    slot_ms   = max(20, int(args.slot_ms))
-    num_slots = max(4,  int(args.num_slots))
-    frame_ms  = slot_ms * num_slots
-    start_ms  = now_ms()
-    next_slot_start = start_ms
-    slot_index = 0
+    lock = threading.Lock()
+    fast_track_enable = threading.Event()
+    stop_event        = threading.Event()
 
-    def do_power_poll():
-        nonlocal system_active, last_power_poll
-        if ms_since(last_power_poll) >= POWER_POLL_MS:
-            last_power_poll = now_ms()
-            new_flag = get_power_flag(args.server, args.device, default=True)
-            if new_flag != system_active:
-                system_active = new_flag
-                log(f"POWER FLAG -> {system_active}")
+    # ---- LED/Buzzer 제어(래치) ----
+    def led_request(on: bool):
+        with lock:
+            state["led_desired"] = bool(on)
 
-    def do_pir_sample():
-        nonlocal prev_pir, armed, tracking_active, last_report
-        cur = GPIO.input(args.pir)
+    def led_manager():
+        # 최소 유지시간 보장 + 단일 적용 지점
+        with lock:
+            desired = state["led_desired"]
+            actual  = state["led_actual"]
+            lastchg = state["last_led_change"]
+        now = now_ms()
 
-        # 에지 로깅
-        if cur != prev_pir:
-            log("PIR:", "사람 감지됨" if cur else "움직임 없음")
-            prev_pir = cur
-            if cur == 0:
-                # PIR이 LOW로 내려가면 언제든 재무장
-                armed = True
-                tracking_active = False
-                if ms_since(last_report) >= REPORT_MIN_INTERVAL_MS:
-                    report(args.server, args.device, "PIR 미감지")
-                    last_report = now_ms()
+        if desired != actual:
+            if (not actual) and (now - lastchg < LED_MIN_OFF_MS):
+                return
+            if actual and (now - lastchg < LED_MIN_ON_MS):
+                return
+            # 실제 하드웨어 적용: LED들과 부저를 동일 상태로 동기화
+            leds_hw_set(led_pins, desired)
+            buzzer_hw_set(buz_pin, desired)   # ★ LED와 동시 ON/OFF (PWM으로 음량 제어)
+            with lock:
+                state["led_actual"] = desired
+                state["last_led_change"] = now
 
-        # 시스템 ON, 비-쿨다운, PIR=HIGH, armed → 추적 시작
-        if system_active and not in_cooldown and cur == 1 and armed:
-            tracking_active = True
-
-        # 쿨다운 중엔 항상 추적 비활성
-        if in_cooldown:
-            tracking_active = False
-
-    def do_ultra_track():
-        # 0.2s(프레임)마다 1회 측정
-        nonlocal in_cooldown, cooldown_until, tracking_active, armed, last_report
-        if not tracking_active:
-            return
-        d, err = measure_once_cm(args.trig, args.echo)
-        if d is None:
-            # 에러 로깅 (타임아웃 등). 스팸 방지 위해 서버 보고는 스로틀
-            if err == "ECHO_LOW_TIMEOUT":
-                log("No echo (LOW TIMEOUT): 배선/전원 확인")
-            elif err == "ECHO_HIGH_TIMEOUT":
-                log("No echo (HIGH TIMEOUT): 레벨시프터/분압 확인")
-            else:
-                log("No echo received.")
-            if ms_since(last_report) >= REPORT_MIN_INTERVAL_MS:
-                report(args.server, args.device, "초음파 응답 없음")
-                last_report = now_ms()
-            return
-
-        log(f"[TRACK] distance={d} cm (every ~{frame_ms/1000:.1f}s)")
-        if d <= DISTANCE_THRESHOLD_CM:
-            # 조건 도달 → 즉시 LED 점등 + 추적 중단 + 쿨다운
-            led_set(args.led, True)
-            in_cooldown     = True
-            cooldown_until  = now_ms() + COOLDOWN_MS
-            tracking_active = False
-            armed           = False   # edge 정책에서 재무장 방지(에지 기다림)
-            log("LED ON - 근접 감지됨 (추적 중단)")
-            if ms_since(last_report) >= REPORT_MIN_INTERVAL_MS:
-                report(args.server, args.device, "사람 감지 및 LED 점등", distance=d)
-                last_report = now_ms()
-
-    def do_led_hb():
-        nonlocal in_cooldown, last_hb, armed, tracking_active
-        # 쿨다운 종료 처리
-        if in_cooldown and now_ms() >= cooldown_until:
-            in_cooldown = False
-            led_set(args.led, False)
-            log("쿨다운 종료 → LED OFF")
-
-            # ★ 재무장 정책 적용
-            if REARM_MODE == "cooldown":
-                if GPIO.input(args.pir) == 1:
-                    armed = True
-                    tracking_active = True   # PIR HIGH 유지 시 즉시 추적 재개
-                else:
-                    armed = True
-                    tracking_active = False
-            else:
-                # edge 모드: PIR LOW→HIGH 에지 올 때까지 대기
-                tracking_active = False
-
-        # 하트비트 (1초)
-        if ms_since(last_hb) >= 1000:
-            last_hb = now_ms()
-            cur = GPIO.input(args.pir)
-            led_state = GPIO.input(args.led)
-            log(f"[HB] PIR={'HIGH' if cur else 'LOW '}  LED={'ON' if led_state else 'OFF'}  TRACK={'ON' if tracking_active else 'OFF'}  ARMED={'Y' if armed else 'N'}")
-
-    try:
-        log(f"[TDM] FRAME={frame_ms}ms  SLOT={slot_ms}ms × {num_slots} slots (ULTRA @ ~{frame_ms/1000:.1f}s)")
-        log(f"[MODE] REARM_MODE={REARM_MODE}")
-        while True:
-            now = now_ms()
-            if now < next_slot_start:
-                time.sleep(min(0.02, (next_slot_start - now)/1000.0))
+    # ---------- 빠른 추적 스레드 ----------
+    def fast_tracker():
+        consec_close = 0
+        while not stop_event.is_set():
+            if not fast_track_enable.is_set():
+                consec_close = 0
+                time.sleep(0.05)
                 continue
 
-            task = SLOT_TASKS.get(slot_index)
-            if task == "POWER_POLL":  do_power_poll()
-            elif task == "PIR_SAMPLE": do_pir_sample()
-            elif task == "ULTRA_TRACK": do_ultra_track()
-            elif task == "LED_HB":     do_led_hb()
+            cur_pir = GPIO.input(args.pir)
+            with lock:
+                active   = SYSTEM_ACTIVE
+                cool     = state["in_cooldown"]
+                armed    = state["armed"]
 
-            slot_index = (slot_index + 1) % num_slots
-            next_slot_start += slot_ms
+            if active and (not cool) and cur_pir == 1 and (REARM_MODE == "cooldown" or armed):
+                d, err = measure_once_cm(args.trig, args.echo)
+                if d is None:
+                    consec_close = 0
+                    with lock:
+                        if now_ms() - state["last_report"] >= REPORT_MIN_INTERVAL_MS:
+                            report(args.server, args.device, "초음파 응답 없음"); state["last_report"] = now_ms()
+                else:
+                    log(f"[FAST] distance={d} cm")
+                    if d <= DISTANCE_THRESHOLD_CM:
+                        consec_close += 1
+                    else:
+                        consec_close = 0
 
-            # 큰 지연시 재정렬
-            if now_ms() - next_slot_start > slot_ms * 2:
-                base = now_ms()
-                slot_index = ((base - start_ms) // slot_ms) % num_slots
-                next_slot_start = base + slot_ms
+                    if consec_close >= CONSEC_CLOSE_REQUIRED:
+                        led_request(True)
+                        with lock:
+                            state["in_cooldown"]    = True
+                            state["cooldown_until"] = now_ms() + COOLDOWN_MS
+                            if REARM_MODE == "edge":
+                                state["armed"] = False
+                            if now_ms() - state["last_report"] >= REPORT_MIN_INTERVAL_MS:
+                                report(args.server, args.device, "사람 감지 및 LED/BUZZER 점등(FAST)", distance=d)
+                                state["last_report"] = now_ms()
+                        consec_close = 0
+            time.sleep(FAST_TRACK_INTERVAL_MS / 1000.0)
+
+    th = threading.Thread(target=fast_tracker, daemon=True); th.start()
+
+    prev_pir = GPIO.input(args.pir)
+
+    try:
+        while not SHUTDOWN_REQUESTED:
+            now = now_ms()
+
+            # 서버 power flag
+            if now - state["last_power_poll"] >= POWER_POLL_MS:
+                state["last_power_poll"] = now
+                new_flag = get_power_flag(args.server, args.device, default=SYSTEM_ACTIVE)
+                if new_flag != SYSTEM_ACTIVE:
+                    SYSTEM_ACTIVE = new_flag; log(f"POWER FLAG -> {SYSTEM_ACTIVE}")
+
+            cur_pir = GPIO.input(args.pir)
+            if cur_pir != prev_pir:
+                log("PIR:", "사람 감지됨" if cur_pir else "움직임 없음")
+                prev_pir = cur_pir
+                if cur_pir == 0 and now - state["last_report"] >= REPORT_MIN_INTERVAL_MS:
+                    report(args.server, args.device, "PIR 미감지"); state["last_report"] = now
+                if cur_pir == 0:
+                    with lock: state["armed"] = True  # 재무장
+
+            # 하트비트
+            if now - state["last_idle_log"] >= 1000:
+                state["last_idle_log"] = now
+                leds_state = "".join("1" if GPIO.input(p) else "0" for p in led_pins)
+                buz_state  = "1" if GPIO.input(buz_pin) else "0"
+                with lock:
+                    hb = f"[HB] active={SYSTEM_ACTIVE} PIR={'HIGH' if cur_pir else 'LOW '} LEDS={leds_state} BUZ={buz_state} cooldown={state['in_cooldown']} armed={state['armed']}"
+                log(hb)
+
+            if not SYSTEM_ACTIVE:
+                fast_track_enable.clear()
+                led_manager()
+                time.sleep(0.2)
+                continue
+
+            # 쿨다운 관리
+            with lock:
+                in_cd   = state["in_cooldown"]
+                cd_end  = state["cooldown_until"]
+
+            if in_cd and now >= cd_end:
+                with lock:
+                    state["in_cooldown"] = False
+                # OFF는 여기서만 수행(안티-플리커 정책 유지)
+                led_request(False)
+                log("쿨다운 종료 → LEDs/Buzzer OFF")
+                if REARM_MODE == "cooldown":
+                    if GPIO.input(args.pir) == 1:
+                        with lock: state["armed"] = True
+
+            # 빠른 추적 활성 조건
+            if SYSTEM_ACTIVE and (not in_cd) and cur_pir == 1:
+                fast_track_enable.set()
+            else:
+                fast_track_enable.clear()
+
+            # 보강용 주기 측정
+            if (now - state["last_measure"]) >= MEASUREMENT_INTERVAL_MS and not in_cd:
+                state["last_measure"] = now
+                if cur_pir == 1:
+                    d, err = measure_median_cm(args.trig, args.echo, n=ULTRA_SAMPLES)
+                    if d is None:
+                        if now - state["last_report"] >= REPORT_MIN_INTERVAL_MS:
+                            report(args.server, args.device, "초음파 응답 없음"); state["last_report"] = now
+                    else:
+                        log(f"Measured distance (median {ULTRA_SAMPLES}): {d} cm")
+                        if d <= DISTANCE_THRESHOLD_CM:
+                            led_request(True)
+                            with lock:
+                                state["in_cooldown"]    = True
+                                state["cooldown_until"] = now + COOLDOWN_MS
+                                if REARM_MODE == "edge":
+                                    state["armed"] = False
+                            if now - state["last_report"] >= REPORT_MIN_INTERVAL_MS:
+                                report(args.server, args.device, "사람 감지 및 LED/BUZZER 점등(PERIODIC)", distance=d)
+                                state["last_report"] = now
+                        else:
+                            if now - state["last_report"] >= REPORT_MIN_INTERVAL_MS:
+                                report(args.server, args.device, "거리 초과, 감지 무효", distance=d)
+                                state["last_report"] = now
+                else:
+                    if now - state["last_report"] >= REPORT_MIN_INTERVAL_MS:
+                        report(args.server, args.device, "PIR 미감지"); state["last_report"] = now
+
+            # 실제 적용
+            led_manager()
+            time.sleep(0.003)
 
     except KeyboardInterrupt:
         pass
     finally:
-        led_set(args.led, False)
+        try:
+            if buz_pwm is not None:
+                buz_pwm.stop()
+        except Exception:
+            pass
+        GPIO.output(buz_pin, GPIO.LOW)
+        for p in led_pins: GPIO.output(p, GPIO.LOW)
         GPIO.cleanup()
-        report(args.server, args.device, "센서 클라이언트 종료 (0.2s 추적모드, REARM_MODE=%s)" % REARM_MODE)
+        report(args.server, args.device, "센서 클라이언트 종료")
         log(f"[STOP] {dt.datetime.now():%F %T}")
 
 if __name__ == "__main__":
