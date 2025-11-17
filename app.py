@@ -62,7 +62,7 @@ def ensure_control_url_column():
         print("[DB] Column check/add failed:", e)
 
 # ---------------- SSH 폴백(기존 방식 유지) ----------------
-SSH_HOST = "192.168.0.50"   # 필요시 수정
+SSH_HOST = "your IP address"   # 필요시 수정
 SSH_USER = "pi"
 SSH_KEY  = None
 SSH_OPTS = "-o BatchMode=yes -o StrictHostKeyChecking=no"
@@ -332,3 +332,4 @@ if __name__ == '__main__':
             db.session.commit()
             print("[INIT] seeded default device: chair1")
     app.run(host='0.0.0.0', port=5000, debug=True)
+
