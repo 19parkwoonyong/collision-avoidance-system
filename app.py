@@ -1,27 +1,29 @@
-# app.py — Flask API (로그인/회원가입 + 장치 상태/전원 + 센서 보고 수신)
-# 실행: python app.py  (기본 포트 5000, 외부접속 가능)
+# app.py — Flask API (로그인/회원가입 + 장치 상태/전원 + 센서 보고 수신 + 에이전트 프록시)
+# 실행: python app.py
 
 from flask import Flask, request, jsonify, session
 from flask_cors import CORS
 from flask_session import Session
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
-import datetime, os, subprocess, platform, shutil
+import datetime, os, subprocess, platform, shutil, sqlite3
+import requests  # 프록시 호출용
 
 app = Flask(__name__)
 
-# ── CORS: 프론트 개발 주소를 명시 허용 (credentials 사용 시 * 불가)
+# ── CORS
 CORS(app,
      supports_credentials=True,
      resources={r"/*": {"origins": [
          "http://localhost:3000",
          "http://127.0.0.1:3000",
-         "http://your-ip-address:3000"
+         "http://your IP address"
      ]}})
 
 # DB & 세션
 basedir = os.path.abspath(os.path.dirname(__file__))
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(basedir, 'users.db')
+DB_PATH = os.path.join(basedir, 'users.db')
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + DB_PATH
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['SESSION_TYPE'] = 'filesystem'
 app.secret_key = 'esp32_secret'
@@ -44,15 +46,27 @@ class Device(db.Model):
     last_updated = db.Column(db.String(100), default=None)
     signal_strength = db.Column(db.String(50), default="N/A")
     distance = db.Column(db.String(50), default="N/A")
+    control_url = db.Column(db.String(200), default=None)  # 에이전트 제어 URL
 
-# ---------------- 실행/중지 대상 (chair1) ----------------
-# 라즈베리파이 SSH 설정
-SSH_HOST = "your-ip-address"      # ← 라즈베리파이 IP/호스트명으로 변경
-SSH_USER = "pi"                   # ← 사용자명
-SSH_KEY  = None                   # 예: r"C:\Users\user\.ssh\id_ed25519" 또는 "/home/user/.ssh/id_rsa"
+# ---- (마이그레이션 보정) control_url 컬럼이 없으면 추가 ----
+def ensure_control_url_column():
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.execute("PRAGMA table_info(Device)")
+            cols = [r[1] for r in cur.fetchall()]
+            if "control_url" not in cols:
+                conn.execute("ALTER TABLE Device ADD COLUMN control_url TEXT")
+                conn.commit()
+                print("[DB] Added column control_url to Device")
+    except Exception as e:
+        print("[DB] Column check/add failed:", e)
+
+# ---------------- SSH 폴백(기존 방식 유지) ----------------
+SSH_HOST = "192.168.0.50"   # 필요시 수정
+SSH_USER = "pi"
+SSH_KEY  = None
 SSH_OPTS = "-o BatchMode=yes -o StrictHostKeyChecking=no"
 
-# 라즈베리파이에서 실제로 돌릴 명령들
 REMOTE = {
     "chair1": {
         "start": (
@@ -74,12 +88,10 @@ REMOTE = {
     }
 }
 
-# 로컬에서 systemctl 가능 여부 감지 (리눅스 + systemctl 존재)
 def _can_local_systemctl():
     return platform.system().lower() == "linux" and shutil.which("systemctl") is not None
 
 def _run(cmd: str, timeout: int = 10):
-    """로컬 쉘 실행 (타임아웃 포함)"""
     try:
         p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
         return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
@@ -88,13 +100,13 @@ def _run(cmd: str, timeout: int = 10):
 
 def _ssh_cmd(remote_cmd: str) -> str:
     key_part = f"-i {SSH_KEY}" if SSH_KEY else ""
-    # bash -lc 로 PATH/로그인 쉘 환경 문제 완화
     return f'ssh {SSH_OPTS} {key_part} {SSH_USER}@{SSH_HOST} "bash -lc \'{remote_cmd}\'"'
 
+# ★ 빠졌던 함수 복구: SSH/로컬 systemctl로 프로세스 시작/중지
 def trigger_process(device_name: str, turn_on: bool):
     """
-    1) 만약 이 Flask가 리눅스 + systemctl 사용 가능하면 로컬에서 수행
-    2) 아니면 SSH로 라즈베리파이에 접속해서 원격 실행
+    1) 서버가 리눅스 + systemctl 가능 → 로컬에서 실행
+    2) 아니면 SSH로 원격 실행
     """
     spec = REMOTE.get(device_name)
     if not spec:
@@ -104,7 +116,7 @@ def trigger_process(device_name: str, turn_on: bool):
     cmd_remote = spec[action]
     cmd_status = spec.get("status")
 
-    # 우선순위 1: 로컬 systemctl (리눅스 서버일 때)
+    # 우선순위 1: 로컬
     if _can_local_systemctl():
         rc, out, err = _run(cmd_remote)
         ok = (rc == 0)
@@ -114,7 +126,7 @@ def trigger_process(device_name: str, turn_on: bool):
             status_msg = f" / status={sout or serr or src}"
         return ok, f"local:{action} rc={rc} out={out} err={err}{status_msg}"
 
-    # 우선순위 2: SSH로 원격 실행 (Windows/ macOS/ systemctl 없는 경우)
+    # 우선순위 2: SSH
     ssh = _ssh_cmd(cmd_remote)
     rc, out, err = _run(ssh)
     ok = (rc == 0)
@@ -123,6 +135,20 @@ def trigger_process(device_name: str, turn_on: bool):
         s_rc, s_out, s_err = _run(_ssh_cmd(cmd_status))
         status_msg = f" / status={s_out or s_err or s_rc}"
     return ok, f"ssh:{action} rc={rc} out={out} err={err}{status_msg}"
+
+# ---------------- 에이전트 프록시 ----------------
+AGENT_TIMEOUT = 2.5
+
+def _agent_post(d: Device, path: str):
+    if not d or not d.control_url:
+        return False, "control_url 없음"
+    try:
+        r = requests.post(f"{d.control_url}{path}", timeout=AGENT_TIMEOUT)
+        if r.status_code == 200:
+            return True, r.text
+        return False, f"HTTP {r.status_code}"
+    except Exception as e:
+        return False, str(e)
 
 # ---------------- 사용자 ----------------
 @app.route('/api/register', methods=['POST'])
@@ -160,7 +186,8 @@ def get_status():
         {
             "id": d.id, "name": d.name, "power": d.power, "status": d.status,
             "last_report": d.last_report, "last_updated": d.last_updated,
-            "signal_strength": d.signal_strength, "distance": d.distance
+            "signal_strength": d.signal_strength, "distance": d.distance,
+            "control_url": d.control_url
         } for d in devices
     ])
 
@@ -172,10 +199,56 @@ def get_status_one(name):
     return jsonify({
         "id": d.id, "name": d.name, "power": d.power, "status": d.status,
         "last_report": d.last_report, "last_updated": d.last_updated,
-        "signal_strength": d.signal_strength, "distance": d.distance
+        "signal_strength": d.signal_strength, "distance": d.distance,
+        "control_url": d.control_url
     })
 
-# ---------------- 전원(= 코드 실행/중지) ----------------
+# ---------------- 에이전트 제어(프록시) ----------------
+@app.route('/api/agent/<name>/wake', methods=['POST'])
+def agent_wake(name):
+    d = Device.query.filter_by(name=name).first()
+    if not d: return jsonify({"error": "not found"}), 404
+    ok, detail = _agent_post(d, "/wake")
+    d.last_report = f"에이전트 WAKE 요청: {'성공' if ok else '실패'} / {detail}"
+    d.last_updated = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if ok: d.power, d.status = True, "동작 중"
+    db.session.commit()
+    return (jsonify({"ok": True, "detail": detail}), 200) if ok else (jsonify({"error":"실행 실패","detail":detail}), 500)
+
+@app.route('/api/agent/<name>/sleep', methods=['POST'])
+def agent_sleep(name):
+    d = Device.query.filter_by(name=name).first()
+    if not d: return jsonify({"error": "not found"}), 404
+    ok, detail = _agent_post(d, "/sleep")
+    d.last_report = f"에이전트 SLEEP 요청: {'성공' if ok else '실패'} / {detail}"
+    d.last_updated = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if ok: d.power, d.status = False, "대기 중"
+    db.session.commit()
+    return (jsonify({"ok": True, "detail": detail}), 200) if ok else (jsonify({"error":"중지 실패","detail":detail}), 500)
+
+@app.route('/api/agent/<name>/quit', methods=['POST'])
+def agent_quit(name):
+    d = Device.query.filter_by(name=name).first()
+    if not d: return jsonify({"error": "not found"}), 404
+    ok, detail = _agent_post(d, "/quit")
+    d.last_report = f"에이전트 QUIT 요청: {'성공' if ok else '실패'} / {detail}"
+    d.last_updated = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if ok: d.power, d.status = False, "대기 중"
+    db.session.commit()
+    return (jsonify({"ok": True, "detail": detail}), 200) if ok else (jsonify({"error":"종료 실패","detail":detail}), 500)
+
+@app.route('/api/agent/<name>/health', methods=['GET'])
+def agent_health(name):
+    d = Device.query.filter_by(name=name).first()
+    if not d or not d.control_url:
+        return jsonify({"error": "not found or no control_url"}), 404
+    try:
+        r = requests.get(f"{d.control_url}/health", timeout=AGENT_TIMEOUT)
+        return jsonify(r.json()), r.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ---------------- (옵션) 기존 SSH 경로 유지 ----------------
 @app.route('/api/power', methods=['POST'])
 def set_power():
     data = request.json or {}
@@ -189,34 +262,27 @@ def set_power():
         d = Device(name=device_name)
         db.session.add(d)
 
-    ok, log = trigger_process(device_name, power_on)
+    # 1순위: control_url 있으면 프록시 사용
+    if d.control_url:
+        path = "/wake" if power_on else "/sleep"
+        ok, detail = _agent_post(d, path)
+        if ok:
+            d.power = power_on
+            d.status = "동작 중" if power_on else "대기 중"
+        d.last_report = f"프록시 전원 요청: {'성공' if ok else '실패'} / {detail}"
+        d.last_updated = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        db.session.commit()
+        return (jsonify({"message":"전원 상태 변경","detail":detail}), 200) if ok else (jsonify({"error":"실행/중지 실패","detail":detail}), 500)
 
+    # 2순위: SSH 폴백
+    ok, log = trigger_process(device_name, power_on)  # ← 이제 정의됨
     if ok:
         d.power = power_on
         d.status = "동작 중" if power_on else "대기 중"
-    d.last_report = (f"프로세스 {'실행' if power_on else '중지'} 요청: "
-                     f"{'성공' if ok else '실패'} / {log}")
+    d.last_report = (f"SSH 전원 요청: {'성공' if ok else '실패'} / {log}")
     d.last_updated = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     db.session.commit()
-
-    if not ok:
-        return jsonify({"error": "실행/중지 실패", "detail": log}), 500
-
-    return jsonify({"message": "전원 상태 변경 완료",
-                    "device": device_name, "power": d.power,
-                    "detail": log}), 200
-
-# (선택) 상태 확인
-@app.route('/api/power/<name>/status', methods=['GET'])
-def power_status(name):
-    spec = REMOTE.get(name)
-    if not spec or not spec.get("status"):
-        return jsonify({"name": name, "status": "unknown"}), 200
-    if _can_local_systemctl():
-        rc, out, err = _run(spec["status"])
-    else:
-        rc, out, err = _run(_ssh_cmd(spec["status"]))
-    return jsonify({"name": name, "status": (out or err or str(rc)).strip()}), 200
+    return (jsonify({"message": "전원 상태 변경 완료", "detail": log}), 200) if ok else (jsonify({"error":"실행/중지 실패","detail":log}), 500)
 
 # ---------------- 센서 보고 수신 ----------------
 @app.route("/api/device-report", methods=["POST"])
@@ -226,6 +292,7 @@ def report():
     message = data.get("message", "")
     signal = data.get("signal_strength", data.get("rssi", "N/A"))
     distance = data.get("distance", "N/A")
+    control_url = data.get("control_url")
 
     d = Device.query.filter_by(name=device_name).first()
     if not d:
@@ -236,6 +303,8 @@ def report():
     d.last_updated = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     d.signal_strength = str(signal) if signal is not None else "N/A"
     d.distance = str(distance) if distance is not None else "N/A"
+    if control_url:
+        d.control_url = control_url
     db.session.commit()
     return jsonify({"received": True})
 
@@ -250,7 +319,6 @@ def seed():
     db.session.commit()
     return jsonify({"created": created})
 
-# (진단용) 헬스체크
 @app.route("/api/health", methods=["GET"])
 def health():
     return jsonify({"ok": True, "devices": Device.query.count()})
@@ -258,7 +326,7 @@ def health():
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
-        # ── 서버 기동 시 장치가 없으면 기본 chair1 자동 생성
+        ensure_control_url_column()  # 컬럼 보정
         if Device.query.count() == 0:
             db.session.add(Device(name="chair1"))
             db.session.commit()
